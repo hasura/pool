@@ -6,6 +6,7 @@
 {-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections       #-}
 
 -- |
 -- Module:      Data.Pool
@@ -29,6 +30,7 @@
 module Data.Pool
     (
       Pool(idleTime, maxResources, numStripes)
+    , TimeoutExceeded (..)
     , getInUseResourceCount
     , LocalPool
     , createPool
@@ -45,7 +47,8 @@ import           Control.Concurrent          (ThreadId, forkIOWithUnmask,
                                               killThread, myThreadId,
                                               threadDelay)
 import           Control.Concurrent.STM
-import           Control.Exception           (SomeException, mask_, onException)
+import           Control.Exception           (SomeException, mask, mask_,
+                                              onException)
 import qualified Control.Exception           as E
 import           Control.Monad               (forM_, forever, join, liftM3,
                                               unless, when)
@@ -63,8 +66,6 @@ import qualified GHC.Event                   as Event
 
 import           Control.Monad.Base          (liftBase)
 import           Control.Monad.Trans.Control (MonadBaseControl, control)
-
-import           Control.Exception           (mask)
 
 -- | A single resource pool entry.
 data Entry a = Entry {
@@ -108,12 +109,20 @@ data Pool a = Pool {
     -- ^ Per-capability resource pools.
     , fin          :: IORef ()
     -- ^ empty value used to attach a finalizer to (internal)
+    , timeout      :: Maybe Int
+    -- ^ Number of seconds to wait while attempting to acquire a
+    -- resource.
     } deriving (Typeable)
 
 instance Show (Pool a) where
     show Pool{..} = "Pool {numStripes = " ++ show numStripes ++ ", " ++
                     "idleTime = " ++ show idleTime ++ ", " ++
                     "maxResources = " ++ show maxResources ++ "}"
+
+data TimeoutExceeded = TimeoutExceeded
+  deriving (Eq, Show)
+
+instance E.Exception TimeoutExceeded
 
 -- | Create a striped resource pool.
 --
@@ -143,8 +152,11 @@ createPool
     -- Requests for resources will block if this limit is reached on a
     -- single stripe, even if other stripes have idle resources
     -- available.
-     -> IO (Pool a)
-createPool create destroy numStripes idleTime maxResources = do
+    -> Maybe Int
+    -- ^ Maximum number of seconds to wait while attempting to acquire
+    -- a resource.
+    -> IO (Pool a)
+createPool create destroy numStripes idleTime maxResources timeout = do
   when (numStripes < 1) $
     modError "pool " $ "invalid stripe count " ++ show numStripes
   when (idleTime < 0.5) $
@@ -164,6 +176,7 @@ createPool create destroy numStripes idleTime maxResources = do
           , maxResources
           , localPools
           , fin
+          , timeout
           }
   mkWeakIORef fin (killThread reaperId) >>
     V.mapM_ (\lp -> mkWeakIORef (lfin lp) (purgeLocalPool destroy lp)) localPools
@@ -233,6 +246,9 @@ purgeLocalPool destroy LocalPool{..} = do
 -- * If the maximum number of resources has been reached, this
 --   function blocks until a resource becomes available.
 --
+-- * If a timeout is set, then this function will only block for
+-- 'timeout' seconds before giving up and returning 'Nothing'.
+--
 -- If the action throws an exception of any type, the resource is
 -- destroyed, and not returned to the pool.
 --
@@ -242,11 +258,11 @@ purgeLocalPool destroy LocalPool{..} = do
 -- an exception.
 withResource ::
     (MonadBaseControl IO m)
-  => Pool a -> (a -> m b) -> m b
-{-# SPECIALIZE withResource :: Pool a -> (a -> IO b) -> IO b #-}
+  => Pool a -> (a -> m b) -> m (Maybe b)
+{-# SPECIALIZE withResource :: Pool a -> (a -> IO b) -> IO (Maybe b) #-}
 withResource pool act = control $ \runInIO -> mask $ \restore -> do
-  (resource, local) <- takeResource pool
-  ret <- restore (runInIO (act resource)) `onException`
+  Just (resource, local) <- takeResource pool
+  ret <- restore (runInIO (Just <$> act resource)) `onException`
             destroyResource pool local resource
   putResource local resource
   return ret
@@ -259,21 +275,56 @@ withResource pool act = control $ \runInIO -> mask $ \restore -> do
 -- This function returns both a resource and the @LocalPool@ it came from so
 -- that it may either be destroyed (via 'destroyResource') or returned to the
 -- pool (via 'putResource').
-takeResource :: Pool a -> IO (a, LocalPool a)
-takeResource pool@Pool{..} = do
-  local@LocalPool{..} <- getLocalPool pool
-  resource <- liftBase . join . atomically $ do
-    ents <- readTVar entries
-    case ents of
-      (Entry{..}:es) -> writeTVar entries es >> return (return entry)
-      [] -> do
-        used <- readTVar inUse
-        when (used == maxResources) retry
-        writeTVar inUse $! used + 1
-        return $
-          create `onException` atomically (modifyTVar_ inUse (subtract 1))
-  return (resource, local)
+--
+-- This function returns 'Nothing' if it a resource is not acquired in
+-- the alotted time (timeout).
+takeResource :: Pool a -> IO (Maybe (a, LocalPool a))
+takeResource pool@Pool{..} =
+  case timeout of
+    Just poolTimeout -> takeResourceWithTimeout poolTimeout pool
+    Nothing -> do
+      local@LocalPool{..} <- getLocalPool pool
+      resource <- liftBase . join . atomically $ do
+        ents <- readTVar entries
+        case ents of
+          (Entry{..}:es) -> writeTVar entries es >> return (return entry)
+          [] -> do
+            used <- readTVar inUse
+            when (used == maxResources) retry
+            writeTVar inUse $! used + 1
+            return $ create `onException` atomically (modifyTVar_ inUse (subtract 1))
+      return $ Just (resource, local)
 {-# INLINABLE takeResource #-}
+
+takeResourceWithTimeout :: Int -> Pool a -> IO (Maybe (a, LocalPool a))
+takeResourceWithTimeout poolTimeout pool@Pool{..} =
+  tryTakeResource pool >>= \case
+    result@(Just _) -> pure result
+    Nothing -> do
+      shouldTimeout <- newTVarIO False
+      mgr <- Event.getSystemTimerManager
+      timeoutKey <-
+        Event.registerTimeout mgr (poolTimeout * 1000000)
+          . atomically
+          . writeTVar shouldTimeout
+          $ True
+      local@LocalPool{..} <- getLocalPool pool
+      (resource :: Maybe a) <- liftBase . join . atomically $ do
+          stop <- readTVar shouldTimeout
+          if stop
+            then pure (pure Nothing)
+            else do
+              ents <- readTVar entries
+              case ents of
+                (Entry{..}:es) -> writeTVar entries es >> return (return $ Just entry)
+                [] -> do
+                  used <- readTVar inUse
+                  when (used == maxResources) retry
+                  writeTVar inUse $! used + 1
+                  return $ fmap Just $ create `onException` atomically (modifyTVar_ inUse (subtract 1))
+      Event.unregisterTimeout mgr timeoutKey
+      return $ (,local) <$> resource
+{-# INLINABLE takeResourceWithTimeout #-}
 
 -- | Similar to 'withResource', but only performs the action if a resource could
 -- be taken from the pool /without blocking/. Otherwise, 'tryWithResource'
@@ -312,7 +363,7 @@ tryTakeResource pool@Pool{..} = do
             writeTVar inUse $! used + 1
             return $ Just <$>
               create `onException` atomically (modifyTVar_ inUse (subtract 1))
-  return $ (flip (,) local) <$> resource
+  return $ (,local) <$> resource
 {-# INLINABLE tryTakeResource #-}
 
 -- | Get a (Thread-)'LocalPool'
@@ -320,7 +371,7 @@ tryTakeResource pool@Pool{..} = do
 -- Internal, just to not repeat code for 'takeResource' and 'tryTakeResource'
 getLocalPool :: Pool a -> IO (LocalPool a)
 getLocalPool Pool{..} = do
-  i <- liftBase $ ((`mod` numStripes) . hash) <$> myThreadId
+  i <- liftBase $ (`mod` numStripes) . hash <$> myThreadId
   return $ localPools V.! i
 {-# INLINABLE getLocalPool #-}
 
