@@ -3,6 +3,7 @@
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE NumericUnderscores  #-}
 {-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -41,19 +42,25 @@ module Data.Pool
     , destroyAllResources
     ) where
 
-import           Control.Concurrent          (ThreadId, forkIOWithUnmask, killThread, myThreadId,
+import           Control.Concurrent          (ThreadId, forkIOWithUnmask,
+                                              killThread, myThreadId,
                                               threadDelay)
-import           Control.Concurrent.STM      (STM, TVar, atomically, newTVarIO, readTVar, retry,
-                                              swapTVar, writeTVar)
-import           Control.Exception           (SomeException, mask, mask_, onException)
+import           Control.Concurrent.STM      (STM, TVar, atomically, newTVarIO,
+                                              readTVar, retry, swapTVar,
+                                              writeTVar)
+import           Control.Exception           (SomeException, mask, mask_,
+                                              onException)
 import qualified Control.Exception           as E
-import           Control.Monad               (forM_, forever, join, liftM3, unless, when)
+import           Control.Monad               (forM_, forever, join, liftM3,
+                                              unless, when)
 import           Data.Foldable               (foldMap')
 import           Data.Hashable               (hash)
 import           Data.IORef                  (IORef, mkWeakIORef, newIORef)
 import           Data.List                   (partition)
 import           Data.Monoid                 (Sum (..))
-import           Data.Time.Clock             (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
+import           Data.Time.Clock             (NominalDiffTime, UTCTime,
+                                              diffUTCTime, getCurrentTime,
+                                              nominalDiffTimeToSeconds)
 import           Data.Typeable               (Typeable)
 import qualified Data.Vector                 as V
 import           GHC.Conc.Sync               (labelThread)
@@ -61,7 +68,6 @@ import qualified GHC.Event                   as Event
 
 import           Control.Monad.Base          (liftBase)
 import           Control.Monad.Trans.Control (MonadBaseControl, control)
-import           Data.Maybe                  (fromMaybe)
 
 -- | A single resource pool entry.
 data Entry a = Entry {
@@ -105,8 +111,8 @@ data Pool a = Pool {
     -- ^ Per-capability resource pools.
     , fin          :: IORef ()
     -- ^ empty value used to attach a finalizer to (internal)
-    , timeout      :: Maybe Int
-    -- ^ Number of seconds to wait while attempting to acquire a
+    , timeout      :: Maybe NominalDiffTime
+    -- ^ Amount of time to wait while attempting to acquire a
     -- resource.
     } deriving (Typeable)
 
@@ -143,9 +149,8 @@ createPool
     -- Requests for resources will block if this limit is reached on a
     -- single stripe, even if other stripes have idle resources
     -- available.
-    -> Maybe Int
-    -- ^ Maximum number of seconds to wait while attempting to acquire
-    -- a resource.
+    -> Maybe NominalDiffTime
+    -- ^ Amount of time to wait while attempting to acquire a resource.
     -> IO (Pool a)
 createPool create destroy numStripes idleTime maxResources timeout = do
   when (numStripes < 1) $
@@ -279,11 +284,10 @@ takeResource pool@Pool{..} =
   tryTakeResource pool >>= \case
     result@(Just _) -> pure result
     Nothing -> do
-      let poolTimeout = fromMaybe maxBound timeout
       shouldTimeout <- newTVarIO False
       mgr <- Event.getSystemTimerManager
       timeoutKey <-
-        Event.registerTimeout mgr (poolTimeout * 1000000)
+        Event.registerTimeout mgr (toSeconds timeout)
           . atomically
           . writeTVar shouldTimeout
           $ True
@@ -303,6 +307,9 @@ takeResource pool@Pool{..} =
                   return $ fmap Just $ create `onException` atomically (modifyTVar_ inUse (subtract 1))
       Event.unregisterTimeout mgr timeoutKey
       return $ (,local) <$> resource
+      where
+        toSeconds :: Maybe NominalDiffTime -> Int
+        toSeconds = maybe maxBound ((* 1_000_000) . round . nominalDiffTimeToSeconds)
 {-# INLINABLE takeResource #-}
 
 -- | Similar to 'withResource', but only performs the action if a resource could
