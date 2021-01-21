@@ -28,9 +28,7 @@
 -- multicore applications, at a trade-off of causing the maximum
 -- number of simultaneous resources in use to grow.
 module Data.Pool
-    (
-      Pool(idleTime, maxResources, numStripes)
-    , TimeoutExceeded (..)
+    ( Pool(idleTime, maxResources, numStripes)
     , getInUseResourceCount
     , LocalPool
     , createPool
@@ -43,22 +41,19 @@ module Data.Pool
     , destroyAllResources
     ) where
 
-import           Control.Concurrent          (ThreadId, forkIOWithUnmask,
-                                              killThread, myThreadId,
+import           Control.Concurrent          (ThreadId, forkIOWithUnmask, killThread, myThreadId,
                                               threadDelay)
-import           Control.Concurrent.STM
-import           Control.Exception           (SomeException, mask, mask_,
-                                              onException)
+import           Control.Concurrent.STM      (STM, TVar, atomically, newTVarIO, readTVar, retry,
+                                              swapTVar, writeTVar)
+import           Control.Exception           (SomeException, mask, mask_, onException)
 import qualified Control.Exception           as E
-import           Control.Monad               (forM_, forever, join, liftM3,
-                                              unless, when)
+import           Control.Monad               (forM_, forever, join, liftM3, unless, when)
 import           Data.Foldable               (foldMap')
 import           Data.Hashable               (hash)
 import           Data.IORef                  (IORef, mkWeakIORef, newIORef)
 import           Data.List                   (partition)
 import           Data.Monoid                 (Sum (..))
-import           Data.Time.Clock             (NominalDiffTime, UTCTime,
-                                              diffUTCTime, getCurrentTime)
+import           Data.Time.Clock             (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import           Data.Typeable               (Typeable)
 import qualified Data.Vector                 as V
 import           GHC.Conc.Sync               (labelThread)
@@ -66,6 +61,7 @@ import qualified GHC.Event                   as Event
 
 import           Control.Monad.Base          (liftBase)
 import           Control.Monad.Trans.Control (MonadBaseControl, control)
+import           Data.Maybe                  (fromMaybe)
 
 -- | A single resource pool entry.
 data Entry a = Entry {
@@ -118,11 +114,6 @@ instance Show (Pool a) where
     show Pool{..} = "Pool {numStripes = " ++ show numStripes ++ ", " ++
                     "idleTime = " ++ show idleTime ++ ", " ++
                     "maxResources = " ++ show maxResources ++ "}"
-
-data TimeoutExceeded = TimeoutExceeded
-  deriving (Eq, Show)
-
-instance E.Exception TimeoutExceeded
 
 -- | Create a striped resource pool.
 --
@@ -256,16 +247,21 @@ purgeLocalPool destroy LocalPool{..} = do
 -- destroy a pooled resource, as doing so will almost certainly cause
 -- a subsequent user (who expects the resource to be valid) to throw
 -- an exception.
-withResource ::
-    (MonadBaseControl IO m)
-  => Pool a -> (a -> m b) -> m (Maybe b)
+withResource
+  :: forall a b m
+   . MonadBaseControl IO m
+  => Pool a
+  -> (a -> m b)
+  -> m (Maybe b)
 {-# SPECIALIZE withResource :: Pool a -> (a -> IO b) -> IO (Maybe b) #-}
 withResource pool act = control $ \runInIO -> mask $ \restore -> do
-  Just (resource, local) <- takeResource pool
-  ret <- restore (runInIO (Just <$> act resource)) `onException`
-            destroyResource pool local resource
-  putResource local resource
-  return ret
+  takeResource pool >>= \case
+    Nothing -> runInIO (pure (Nothing :: Maybe b))
+    Just (resource, local) -> do
+      ret <- restore (runInIO (Just <$> act resource)) `onException`
+                  destroyResource pool local resource
+      putResource local resource
+      return ret
 {-# INLINABLE withResource #-}
 
 -- | Take a resource from the pool, following the same results as
@@ -276,31 +272,14 @@ withResource pool act = control $ \runInIO -> mask $ \restore -> do
 -- that it may either be destroyed (via 'destroyResource') or returned to the
 -- pool (via 'putResource').
 --
--- This function returns 'Nothing' if it a resource is not acquired in
+-- This function returns 'Nothing' if a resource is not acquired in
 -- the alotted time (timeout).
 takeResource :: Pool a -> IO (Maybe (a, LocalPool a))
 takeResource pool@Pool{..} =
-  case timeout of
-    Just poolTimeout -> takeResourceWithTimeout poolTimeout pool
-    Nothing -> do
-      local@LocalPool{..} <- getLocalPool pool
-      resource <- liftBase . join . atomically $ do
-        ents <- readTVar entries
-        case ents of
-          (Entry{..}:es) -> writeTVar entries es >> return (return entry)
-          [] -> do
-            used <- readTVar inUse
-            when (used == maxResources) retry
-            writeTVar inUse $! used + 1
-            return $ create `onException` atomically (modifyTVar_ inUse (subtract 1))
-      return $ Just (resource, local)
-{-# INLINABLE takeResource #-}
-
-takeResourceWithTimeout :: Int -> Pool a -> IO (Maybe (a, LocalPool a))
-takeResourceWithTimeout poolTimeout pool@Pool{..} =
   tryTakeResource pool >>= \case
     result@(Just _) -> pure result
     Nothing -> do
+      let poolTimeout = fromMaybe maxBound timeout
       shouldTimeout <- newTVarIO False
       mgr <- Event.getSystemTimerManager
       timeoutKey <-
@@ -324,7 +303,7 @@ takeResourceWithTimeout poolTimeout pool@Pool{..} =
                   return $ fmap Just $ create `onException` atomically (modifyTVar_ inUse (subtract 1))
       Event.unregisterTimeout mgr timeoutKey
       return $ (,local) <$> resource
-{-# INLINABLE takeResourceWithTimeout #-}
+{-# INLINABLE takeResource #-}
 
 -- | Similar to 'withResource', but only performs the action if a resource could
 -- be taken from the pool /without blocking/. Otherwise, 'tryWithResource'
