@@ -3,6 +3,7 @@
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE NamedFieldPuns      #-}
+{-# LANGUAGE NumericUnderscores          #-}
 {-# LANGUAGE RankNTypes          #-}
 {-# LANGUAGE RecordWildCards     #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -31,7 +32,9 @@ module Data.Pool
       Pool(idleTime, maxResources, numStripes)
     , getInUseResourceCount
     , LocalPool
+    , TimeoutException (..)
     , createPool
+    , createPool'
     , withResource
     , takeResource
     , tryWithResource
@@ -44,7 +47,7 @@ module Data.Pool
 import           Control.Concurrent          (ThreadId, forkIOWithUnmask, killThread, myThreadId,
                                               threadDelay)
 import           Control.Concurrent.STM
-import           Control.Exception           (SomeException, mask, mask_, onException)
+import           Control.Exception           (Exception, SomeException, mask, mask_, onException)
 import qualified Control.Exception           as E
 import           Control.Monad               (forM_, forever, join, liftM3, unless, when)
 import           Data.Foldable               (foldMap')
@@ -52,13 +55,14 @@ import           Data.Hashable               (hash)
 import           Data.IORef                  (IORef, mkWeakIORef, newIORef)
 import           Data.List                   (partition)
 import           Data.Monoid                 (Sum (..))
-import           Data.Time.Clock             (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
+import           Data.Time.Clock             (nominalDiffTimeToSeconds, NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
 import           Data.Typeable               (Typeable)
 import qualified Data.Vector                 as V
 import           GHC.Conc.Sync               (labelThread)
 
 import           Control.Monad.Base          (liftBase)
 import           Control.Monad.Trans.Control (MonadBaseControl, control)
+import qualified GHC.Event as Event
 
 -- | A single resource pool entry.
 data Entry a = Entry {
@@ -102,6 +106,8 @@ data Pool a = Pool {
     -- ^ Per-capability resource pools.
     , fin          :: IORef ()
     -- ^ empty value used to attach a finalizer to (internal)
+    , timeout      :: Maybe NominalDiffTime
+    -- ^ Amount of time to wait while attempting to acquire a resource.
     } deriving (Typeable)
 
 instance Show (Pool a) where
@@ -109,6 +115,11 @@ instance Show (Pool a) where
                     "idleTime = " ++ show idleTime ++ ", " ++
                     "maxResources = " ++ show maxResources ++ "}"
 
+data TimeoutException = TimeoutException
+  deriving Show
+
+instance Exception TimeoutException
+    
 -- | Create a striped resource pool.
 --
 -- Although the garbage collector will destroy all idle resources when
@@ -137,8 +148,43 @@ createPool
     -- Requests for resources will block if this limit is reached on a
     -- single stripe, even if other stripes have idle resources
     -- available.
-     -> IO (Pool a)
-createPool create destroy numStripes idleTime maxResources = do
+    -> IO (Pool a)
+createPool create destroy numStripes idleTime maxResources =
+  createPool' create destroy numStripes idleTime maxResources Nothing
+
+-- | Create a striped resource pool with a connection acquisition
+-- timeout.
+--
+-- Although the garbage collector will destroy all idle resources when
+-- the pool is garbage collected it's recommended to manually
+-- 'destroyAllResources' when you're done with the pool so that the
+-- resources are freed up as soon as possible.
+createPool'
+    :: IO a
+    -- ^ Action that creates a new resource.
+    -> (a -> IO ())
+    -- ^ Action that destroys an existing resource.
+    -> Int
+    -- ^ The number of stripes (distinct sub-pools) to maintain.
+    -- The smallest acceptable value is 1.
+    -> NominalDiffTime
+    -- ^ Amount of time for which an unused resource is kept open.
+    -- The smallest acceptable value is 0.5 seconds.
+    --
+    -- The elapsed time before destroying a resource may be a little
+    -- longer than requested, as the reaper thread wakes at 1-second
+    -- intervals.
+    -> Int
+    -- ^ Maximum number of resources to keep open per stripe.  The
+    -- smallest acceptable value is 1.
+    --
+    -- Requests for resources will block if this limit is reached on a
+    -- single stripe, even if other stripes have idle resources
+    -- available.
+    -> Maybe NominalDiffTime
+    -- ^ Amount of time to wait while attempting to acquire a resource.
+    -> IO (Pool a)
+createPool' create destroy numStripes idleTime maxResources timeout = do
   when (numStripes < 1) $
     modError "pool " $ "invalid stripe count " ++ show numStripes
   when (idleTime < 0.5) $
@@ -158,11 +204,13 @@ createPool create destroy numStripes idleTime maxResources = do
           , maxResources
           , localPools
           , fin
+          , timeout
           }
   mkWeakIORef fin (killThread reaperId) >>
     V.mapM_ (\lp -> mkWeakIORef (lfin lp) (purgeLocalPool destroy lp)) localPools
   return p
 
+  
 -- TODO: Propose 'forkIOLabeledWithUnmask' for the base library.
 
 -- | Sparks off a new thread using 'forkIOWithUnmask' to run the given
@@ -227,6 +275,9 @@ purgeLocalPool destroy LocalPool{..} = do
 -- * If the maximum number of resources has been reached, this
 --   function blocks until a resource becomes available.
 --
+-- * If a timeout is set, then this function will only block for
+-- 'timeout' seconds before throwing a 'TimeoutException'.
+--
 -- If the action throws an exception of any type, the resource is
 -- destroyed, and not returned to the pool.
 --
@@ -250,23 +301,41 @@ withResource pool act = control $ \runInIO -> mask $ \restore -> do
 -- 'withResource'. Note that this function should be used with caution, as
 -- improper exception handling can lead to leaked resources.
 --
+-- * If a timeout is set, then this function will only block for
+-- 'timeout' seconds before throwing a 'TimeoutException'.
+--
 -- This function returns both a resource and the @LocalPool@ it came from so
 -- that it may either be destroyed (via 'destroyResource') or returned to the
 -- pool (via 'putResource').
 takeResource :: Pool a -> IO (a, LocalPool a)
 takeResource pool@Pool{..} = do
+  timeoutSync <- newTVarIO False
+  mgr <- Event.getSystemTimerManager
+  timeoutKey <-
+    Event.registerTimeout mgr (toSeconds timeout)
+      . atomically
+      . writeTVar timeoutSync
+      $ True
   local@LocalPool{..} <- getLocalPool pool
   resource <- liftBase . join . atomically $ do
-    ents <- readTVar entries
-    case ents of
-      (Entry{..}:es) -> writeTVar entries es >> return (return entry)
-      [] -> do
-        used <- readTVar inUse
-        when (used == maxResources) retry
-        writeTVar inUse $! used + 1
-        return $
-          create `onException` atomically (modifyTVar_ inUse (subtract 1))
+    stop <- readTVar timeoutSync
+    if stop
+      then throwSTM TimeoutException
+      else do
+        ents <- readTVar entries
+        case ents of
+          (Entry{..}:es) -> writeTVar entries es >> return (return entry)
+          [] -> do
+            used <- readTVar inUse
+            when (used == maxResources) retry
+            writeTVar inUse $! used + 1
+            return $
+              create `onException` atomically (modifyTVar_ inUse (subtract 1))
+  Event.unregisterTimeout mgr timeoutKey
   return (resource, local)
+  where
+    toSeconds :: Maybe NominalDiffTime -> Int
+    toSeconds = maybe maxBound ((* 1_000_000) . round . nominalDiffTimeToSeconds)
 {-# INLINABLE takeResource #-}
 
 -- | Similar to 'withResource', but only performs the action if a resource could
