@@ -312,7 +312,7 @@ takeResource pool@Pool{..} = do
   timeoutSync <- newTVarIO False
   mgr <- Event.getSystemTimerManager
   timeoutKey <-
-    Event.registerTimeout mgr (toSeconds timeout)
+    Event.registerTimeout mgr (toMicroseconds timeout)
       . atomically
       . writeTVar timeoutSync
       $ True
@@ -334,8 +334,8 @@ takeResource pool@Pool{..} = do
   Event.unregisterTimeout mgr timeoutKey
   return (resource, local)
   where
-    toSeconds :: Maybe NominalDiffTime -> Int
-    toSeconds = maybe maxBound ((* 1_000_000) . round . nominalDiffTimeToSeconds)
+    toMicroseconds :: Maybe NominalDiffTime -> Int
+    toMicroseconds = maybe maxBound ((* 1_000_000) . round . nominalDiffTimeToSeconds)
 {-# INLINABLE takeResource #-}
 
 -- | Similar to 'withResource', but only performs the action if a resource could
