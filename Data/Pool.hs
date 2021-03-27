@@ -316,26 +316,34 @@ takeResource pool@Pool{..} = do
       . atomically
       . writeTVar timeoutSync
       $ True
-  local@LocalPool{..} <- getLocalPool pool
-  resource <- liftBase . join . atomically $ do
-    stop <- readTVar timeoutSync
-    if stop
-      then throwSTM TimeoutException
-      else do
-        ents <- readTVar entries
-        case ents of
-          (Entry{..}:es) -> writeTVar entries es >> return (return entry)
-          [] -> do
-            used <- readTVar inUse
-            when (used == maxResources) retry
-            writeTVar inUse $! used + 1
-            return $
-              create `onException` atomically (modifyTVar_ inUse (subtract 1))
-  Event.unregisterTimeout mgr timeoutKey
-  return (resource, local)
+  -- :TODO (Naveen): I fear recursion is the bad way to go about it. My fear is that when the connection in the pool
+  -- is full, we will keep on calling the function again and again to check if the resource is empty.
+  -- What would happen in the scenario when the resources are never released by other process, we would
+  -- end up in an infinite loop and this might increase the memory consumption no?
+  -- Though this could be avoided, if we set a default timeout value - But doing so will then change
+  -- the current behaviour of how TimeoutException works.
+
+  -- Recursive function.
+  -- This will help us to keep track of timeout as well as log the stuff
+  tryTakeResourceWithLogging pool mgr timeoutKey
   where
     toMicroseconds :: Maybe NominalDiffTime -> Int
     toMicroseconds = maybe maxBound ((* 1_000_000) . round . nominalDiffTimeToSeconds)
+
+    -- If we reach maximum connections, then log the error and then retry fetching the resource again
+    tryTakeResourceWithLogging :: Pool a -> Event.TimerManager -> Event.TimeoutKey -> IO (a, LocalPool a)
+    tryTakeResourceWithLogging pool mgr timeoutKey = do
+      -- tryTakeResource will return Nothing when maxConnection is reached.
+      resource' <- tryTakeResource pool
+      case resource' of
+        (Nothing, _isConnPoolAlmostSaturated) -> do
+          print "Max connection Reached"
+          tryTakeResourceWithLogging pool mgr timeoutKey
+        -- If resources are available in pool, emit warning if pool is nearing saturation
+        (Just (resource, local), isConnPoolAlmostSaturated) -> do
+          when isConnPoolAlmostSaturated $ print "Connection Pool nearing saturation, Consider increasing pool size"
+          Event.unregisterTimeout mgr timeoutKey
+          return (resource, local)
 {-# INLINABLE takeResource #-}
 
 -- | Similar to 'withResource', but only performs the action if a resource could
@@ -349,33 +357,37 @@ tryWithResource :: forall m a b.
 tryWithResource pool act = control $ \runInIO -> mask $ \restore -> do
   res <- tryTakeResource pool
   case res of
-    Just (resource, local) -> do
+    (Just (resource, local), _isConnPoolAlmostSaturated) -> do
       ret <- restore (runInIO (Just <$> act resource)) `onException`
                 destroyResource pool local resource
       putResource local resource
       return ret
-    Nothing -> restore . runInIO $ return (Nothing :: Maybe b)
+    (Nothing, _) -> restore . runInIO $ return (Nothing :: Maybe b)
 {-# INLINABLE tryWithResource #-}
 
 -- | A non-blocking version of 'takeResource'. The 'tryTakeResource' function
 -- returns immediately, with 'Nothing' if the pool is exhausted, or @'Just' (a,
--- 'LocalPool' a)@ if a resource could be borrowed from the pool successfully.
-tryTakeResource :: Pool a -> IO (Maybe (a, LocalPool a))
+-- 'LocalPool' a, Bool)@ if a resource could be borrowed from the pool successfully.
+-- The Bool is True, if the connection pool is near saturation i.e 80% or more of 
+-- the resources are currently in use, else it is False. 
+tryTakeResource :: Pool a -> IO (Maybe (a, LocalPool a), Bool)
 tryTakeResource pool@Pool{..} = do
   local@LocalPool{..} <- getLocalPool pool
-  resource <- liftBase . join . atomically $ do
+  (resource, isConnPoolAlmostSaturated) <- liftBase . join . atomically $ do
     ents <- readTVar entries
     case ents of
-      (Entry{..}:es) -> writeTVar entries es >> return (return . Just $ entry)
+      (Entry{..}:es) -> writeTVar entries es >> return (return (Just entry, False))
       [] -> do
         used <- readTVar inUse
+        -- The connection pool is nearing saturation when 80% of the 
+        -- resources in the pool are already inuse
+        let isConnPoolAlmostSaturated = ((0.8 * fromIntegral maxResources) >= fromIntegral used)
         if used == maxResources
-          then return (return Nothing)
+          then return (return (Nothing, isConnPoolAlmostSaturated))
           else do
             writeTVar inUse $! used + 1
-            return $ Just <$>
-              create `onException` atomically (modifyTVar_ inUse (subtract 1))
-  return $ (flip (,) local) <$> resource
+            return $ (flip (,) isConnPoolAlmostSaturated) <$> (Just <$> create `onException` atomically (modifyTVar_ inUse (subtract 1)))
+  return $ (((flip (,) local) <$> resource), isConnPoolAlmostSaturated)
 {-# INLINABLE tryTakeResource #-}
 
 -- | Get a (Thread-)'LocalPool'
