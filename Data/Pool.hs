@@ -39,6 +39,8 @@ module Data.Pool
     , takeResource
     , tryWithResource
     , tryTakeResource
+    , tryWithResourceSaturationLevel
+    , tryTakeResourceWithSaturationLevel
     , destroyResource
     , putResource
     , destroyAllResources
@@ -377,6 +379,44 @@ tryTakeResource pool@Pool{..} = do
               create `onException` atomically (modifyTVar_ inUse (subtract 1))
   return $ (flip (,) local) <$> resource
 {-# INLINABLE tryTakeResource #-}
+
+-- | Similar to 'tryWithResource', but only returns the current saturation level
+-- of the pool.
+tryWithResourceSaturationLevel :: forall m a b.
+    (MonadBaseControl IO m)
+  => Pool a -> (a -> Int -> m b) -> m (Maybe b)
+tryWithResourceSaturationLevel pool act = control $ \runInIO -> mask $ \restore -> do
+  res <- tryTakeResourceWithSaturationLevel pool
+  case res of
+    Just (resource, local, saturationLevel) -> do
+      ret <- restore (runInIO (Just <$> act resource saturationLevel)) `onException`
+                destroyResource pool local resource
+      putResource local resource
+      return ret
+    Nothing -> restore . runInIO $ return (Nothing :: Maybe b)
+{-# INLINABLE tryWithResourceSaturationLevel #-}
+
+-- | Similar to 'tryTakeResource', but also returns the current saturation level of 
+-- pool
+tryTakeResourceWithSaturationLevel :: Pool a -> IO (Maybe (a, LocalPool a, Int))
+tryTakeResourceWithSaturationLevel pool@Pool{..} = do
+  local@LocalPool{..} <- getLocalPool pool
+  resourceWithSaturationLevel <- liftBase . join . atomically $ do
+    ents <- readTVar entries
+    -- Calculate the saturation level
+    used <- readTVar inUse
+    let saturationLevel = (used * 100 ) `div` maxResources
+    case ents of
+      (Entry{..}:es) -> writeTVar entries es >> return (return $ Just (entry, saturationLevel))
+      [] -> do
+        if used == maxResources
+          then return (return Nothing)
+          else do
+            writeTVar inUse $! used + 1
+            return $ (\res -> Just (res, saturationLevel)) <$>
+              create `onException` atomically (modifyTVar_ inUse (subtract 1))
+  return $ resourceWithSaturationLevel >>= (\(res, satLevel) -> Just (res, local, satLevel))
+{-# INLINABLE tryTakeResourceWithSaturationLevel #-}
 
 -- | Get a (Thread-)'LocalPool'
 --
